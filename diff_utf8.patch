@@ -1,0 +1,2327 @@
+﻿diff --git a/FinAssist/backend/app/agents/__init__.py b/FinAssist/backend/app/agents/__init__.py
+index b943b61..d0d6a63 100644
+--- a/FinAssist/backend/app/agents/__init__.py
++++ b/FinAssist/backend/app/agents/__init__.py
+@@ -1,4 +1,12 @@
+-from .expense_agent import classify_expense
++from .expense_agent import classify_expense, suggest_expense_categories
+ from .tax_agent import analyze_tax_deductibility
++from .insight_agent import analyze_spending_trends
++from .interaction_agent import handle_user_query
+ 
+-__all__ = ["classify_expense", "analyze_tax_deductibility"]
++__all__ = [
++	"classify_expense",
++	"suggest_expense_categories",
++	"analyze_tax_deductibility",
++	"analyze_spending_trends",
++	"handle_user_query",
++]
+diff --git a/FinAssist/backend/app/agents/expense_agent.py b/FinAssist/backend/app/agents/expense_agent.py
+index a1debe7..ab344a0 100644
+--- a/FinAssist/backend/app/agents/expense_agent.py
++++ b/FinAssist/backend/app/agents/expense_agent.py
+@@ -1,33 +1,124 @@
+ import json
+-from openai import OpenAI
+-from app.config import OPENAI_API_KEY
++import re
++from app.services.llm_service import generate_json_completion
+ 
+-client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
++# Standardized Indian expense categories
++CATEGORIES = [
++    "Food & Dining", "Grocery", "Transport", "Shopping",
++    "Utilities", "Healthcare", "Entertainment", "Education",
++    "Investment", "Insurance", "Rent", "EMI & Loans",
++    "Salary & Income", "Transfer", "Miscellaneous"
++]
+ 
+-def classify_expense(merchant: str, description: str, amount: float) -> dict:
+-    """Classifies an expense into a category using LLM context if available."""
+-    if not client:
+-        return {"category": "Miscellaneous", "confidence_score": 0.5, "reasoning": "Mock API"}
+-        
+-    prompt = f"""
+-    You are an AI Expense Classifier.
+-    Given a transaction:
+-    Merchant: {merchant}
+-    Description: {description}
+-    Amount: {amount}
++# Rule-based keyword map for fast, offline classification of known merchants
++KEYWORD_RULES = {
++    "Food & Dining": ["swiggy", "zomato", "dominos", "mcdonald", "kfc", "pizza hut", "starbucks",
++                       "cafe coffee day", "barbeque nation", "chai point", "faasos", "biryani",
++                       "restaurant", "food", "dining", "burger king", "subway"],
++    "Grocery": ["bigbasket", "blinkit", "zepto", "dmart", "big bazaar", "reliance fresh",
++                "jiomart", "grofers", "spencer", "nature's basket", "more supermarket"],
++    "Transport": ["uber", "ola", "rapido", "metro", "irctc", "indigo", "spicejet", "vistara",
++                  "petrol", "diesel", "indian oil", "bharat petroleum", "hp petrol", "makemytrip",
++                  "redbus", "blusmart", "air india"],
++    "Shopping": ["amazon", "flipkart", "myntra", "ajio", "nykaa", "croma", "reliance digital",
++                 "shoppers stop", "westside", "meesho", "tata cliq", "decathlon", "ikea", "pepperfry"],
++    "Utilities": ["tata power", "bses", "jio", "airtel", "vodafone", "vi ", "act fibernet",
++                  "bsnl", "mahanagar gas", "indane", "jal board", "hathway", "tata sky",
++                  "electricity", "broadband", "recharge", "water bill"],
++    "Healthcare": ["apollo", "practo", "pharmeasy", "1mg", "medplus", "narayana health",
++                   "max healthcare", "fortis", "lenskart", "dr. lal", "netmeds", "medicine",
++                   "hospital", "clinic", "pharmacy"],
++    "Entertainment": ["netflix", "amazon prime", "hotstar", "spotify", "bookmyshow", "pvr",
++                      "inox", "sony liv", "youtube premium", "jiocinema", "audible", "playstation"],
++    "Education": ["unacademy", "byju", "coursera", "udemy", "vedantu", "upgrad", "chegg",
++                  "kindle", "great learning", "simplilearn", "tuition", "school fee"],
++    "Investment": ["zerodha", "groww", "paytm money", "mutual fund", "sip", "ppf", "nsc",
++                   "nps", "elss", "kotak amc", "axis mutual"],
++    "Insurance": ["lic", "hdfc life", "icici lombard", "star health", "bajaj allianz",
++                  "max life", "sbi life", "policybazaar", "care health", "digit insurance",
++                  "insurance premium"],
++    "Rent": ["house rent", "nobroker", "magicbricks", "pg accommodation", "co-living", "rent pay"],
++    "EMI & Loans": ["emi", "home loan", "car loan", "personal loan", "education loan",
++                    "bajaj finserv", "loan installment"],
++}
++
++CONFIDENCE_THRESHOLD = 0.6
++
++def _rule_based_classify(merchant: str, description: str) -> dict:
++    """Fast, offline classification using keyword matching."""
++    text = f"{merchant} {description}".lower()
+     
+-    Categorize this transaction into a standard budget category (e.g. Food, Travel, Rent, Software, Utilities).
+-    Provide a confidence score (0.0 to 1.0) and a brief reasoning in exactly the following JSON format:
+-    {{"category": "category_name", "confidence_score": 0.9, "reasoning": "reasoning text"}}
+-    """
++    for category, keywords in KEYWORD_RULES.items():
++        for kw in keywords:
++            if kw in text:
++                return {"category": category, "confidence_score": 0.92, "reasoning": f"Rule match: '{kw}'"}
++    
++    return None  # No rule matched
++
++def _llm_classify(merchant: str, description: str, amount: float) -> dict:
++    """Fallback to LLM for unknown merchants."""
++    categories_str = ", ".join(CATEGORIES)
++    prompt = f"""You are FinAssist AI Expense Classifier for Indian users.
++
++Transaction:
++- Merchant: {merchant}
++- Description: {description}  
++- Amount: Γé╣{amount}
++
++Classify into EXACTLY one of these categories: {categories_str}
++
++Return ONLY valid JSON:
++{{"category": "category_name", "confidence_score": 0.9, "reasoning": "brief reason"}}"""
++
++    result = generate_json_completion(
++        system_prompt="You classify Indian personal finance transactions.",
++        user_prompt=prompt,
++        temperature=0.0,
++    )
++
++    if not result:
++        return {"category": "Miscellaneous", "confidence_score": 0.5, "reasoning": "LLM unavailable"}
++
++    if result.get("category") not in CATEGORIES:
++        result["category"] = "Miscellaneous"
++        result["confidence_score"] = 0.4
++    return result
++
++def classify_expense(merchant: str, description: str, amount: float) -> dict:
++    """Hybrid classifier: tries rule-based first, falls back to LLM."""
++    # Step 1: Try fast rule-based matching
++    result = _rule_based_classify(merchant, description)
++    if result and result["confidence_score"] >= CONFIDENCE_THRESHOLD:
++        return result
+     
+-    try:
+-        response = client.chat.completions.create(
+-            model="gpt-3.5-turbo",
+-            messages=[{"role": "user", "content": prompt}],
+-            temperature=0.0
+-        )
+-        return json.loads(response.choices[0].message.content)
+-    except Exception as e:
+-        print(f"Error classifying expense: {e}")
+-        return {"category": "Unknown", "confidence_score": 0.0, "reasoning": str(e)}
++    # Step 2: Fall back to LLM
++    return _llm_classify(merchant, description, amount)
++
++
++def suggest_expense_categories(merchant: str, description: str, amount: float, top_k: int = 4) -> list:
++    """Generate short, user-friendly category suggestions for human confirmation."""
++    prediction = classify_expense(merchant, description, amount)
++    primary = prediction.get("category", "Miscellaneous")
++
++    suggestions = [primary]
++    text = f"{merchant} {description}".lower()
++
++    # Add category hints based on overlapping rule keywords.
++    for category, keywords in KEYWORD_RULES.items():
++        if category == primary:
++            continue
++        if any(kw in text for kw in keywords):
++            suggestions.append(category)
++        if len(suggestions) >= top_k:
++            break
++
++    # Fill remaining slots with common categories to keep UX consistent.
++    for category in CATEGORIES:
++        if category not in suggestions:
++            suggestions.append(category)
++        if len(suggestions) >= top_k:
++            break
++
++    suggestions.append("Others")
++    return suggestions
++
+diff --git a/FinAssist/backend/app/agents/insight_agent.py b/FinAssist/backend/app/agents/insight_agent.py
+index 693fa98..a2b3a73 100644
+--- a/FinAssist/backend/app/agents/insight_agent.py
++++ b/FinAssist/backend/app/agents/insight_agent.py
+@@ -1,17 +1,92 @@
+ import pandas as pd
++import numpy as np
+ from typing import List, Dict
+ 
+ def analyze_spending_trends(transactions: List[dict]) -> Dict:
+-    """Analyze spending to find trends and anomalies."""
++    """Comprehensive spending analysis with trends, anomalies, and insights."""
+     if not transactions:
+-        return {"trends": {}, "anomalies": []}
++        return {"trends": {}, "anomalies": [], "summary": {}}
+         
+     df = pd.DataFrame(transactions)
++    
+     if 'date' in df.columns and 'amount' in df.columns:
+         df['date'] = pd.to_datetime(df['date'], errors='coerce')
++        df['amount'] = pd.to_numeric(df['amount'], errors='coerce')
++        df = df.dropna(subset=['date', 'amount'])
+         df = df.sort_values('date')
+-        
++    else:
++        return {"summary": "Missing required columns", "total_spent": 0.0}
++    
++    total_spent = float(df['amount'].sum())
++    avg_transaction = float(df['amount'].mean())
++    transaction_count = len(df)
++    
++    # Category breakdown
++    category_breakdown = {}
++    if 'category' in df.columns:
++        cat_group = df.groupby('category')['amount'].agg(['sum', 'count', 'mean'])
++        for cat, row in cat_group.iterrows():
++            category_breakdown[cat] = {
++                "total": round(float(row['sum']), 2),
++                "count": int(row['count']),
++                "avg": round(float(row['mean']), 2),
++                "percentage": round(float(row['sum'] / total_spent * 100), 1) if total_spent > 0 else 0
++            }
++    
++    # Monthly trends
++    monthly_trends = {}
++    if not df.empty:
++        df['month'] = df['date'].dt.to_period('M').astype(str)
++        monthly = df.groupby('month')['amount'].sum()
++        monthly_trends = {k: round(float(v), 2) for k, v in monthly.items()}
++    
++    # Top merchants
++    top_merchants = {}
++    if 'merchant' in df.columns:
++        merch_group = df.groupby('merchant')['amount'].sum().nlargest(10)
++        top_merchants = {k: round(float(v), 2) for k, v in merch_group.items()}
++    
++    # Anomaly detection (simple z-score)
++    anomalies = []
++    if len(df) > 5:
++        mean_amt = df['amount'].mean()
++        std_amt = df['amount'].std()
++        if std_amt > 0:
++            df['z_score'] = (df['amount'] - mean_amt) / std_amt
++            outliers = df[df['z_score'].abs() > 2]
++            for _, row in outliers.iterrows():
++                anomalies.append({
++                    "date": str(row['date']),
++                    "merchant": row.get('merchant', 'Unknown'),
++                    "amount": round(float(row['amount']), 2),
++                    "z_score": round(float(row['z_score']), 2),
++                    "flag": "Unusually high" if row['z_score'] > 0 else "Unusually low"
++                })
++    
++    # Budget health score (0-100)
++    health_score = 100
++    if category_breakdown:
++        # Penalize if any single category exceeds 40% of total spend
++        for cat, data in category_breakdown.items():
++            if data["percentage"] > 40 and cat not in ["Rent", "EMI & Loans", "Investment"]:
++                health_score -= 15
++        # Bonus for having investments/insurance
++        if "Investment" in category_breakdown:
++            health_score += 5
++        if "Insurance" in category_breakdown:
++            health_score += 5
++    health_score = max(0, min(100, health_score))
++    
+     return {
+-        "summary": "Detailed insight implementation pending",
+-        "total_spent": float(df['amount'].sum()) if 'amount' in df.columns else 0.0
++        "summary": {
++            "total_spent": round(total_spent, 2),
++            "avg_transaction": round(avg_transaction, 2),
++            "transaction_count": transaction_count,
++            "health_score": health_score
++        },
++        "category_breakdown": category_breakdown,
++        "monthly_trends": monthly_trends,
++        "top_merchants": top_merchants,
++        "anomalies": anomalies
+     }
++
+diff --git a/FinAssist/backend/app/agents/interaction_agent.py b/FinAssist/backend/app/agents/interaction_agent.py
+index 9b8c782..546b8cc 100644
+--- a/FinAssist/backend/app/agents/interaction_agent.py
++++ b/FinAssist/backend/app/agents/interaction_agent.py
+@@ -1,27 +1,43 @@
+-from openai import OpenAI
+-from app.config import OPENAI_API_KEY
+-
+-client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
++from app.services.rag_service import rag_service
++from app.services.llm_service import generate_chat_completion
+ 
+ def handle_user_query(query: str, context: str) -> str:
+-    """Conversational AI to answer finance questions based on context."""
+-    if not client:
+-        return "I am unable to connect to the AI service."
+-
+-    prompt = f"""
+-    You are FinAssist, a helpful personal financial assistant.
+-    User Query: {query}
+-    Current Financial Context:
+-    {context}
++    """RAG-powered conversational AI for finance questions."""
++    
++    # Step 1: Search knowledge base for relevant info
++    rag_results = rag_service.search(query, k=5)
++    kb_context = "\n".join([res["document"] for res in rag_results]) if rag_results else ""
+     
+-    Provide a brief, helpful answer.
+-    """
++    if not kb_context:
++        kb_context = "No matching knowledge base snippets found."
++
++    prompt = f"""You are FinAssist, an expert Indian personal finance assistant.
++
++User's Financial Summary:
++{context}
++
++Relevant Knowledge Base Information:
++{kb_context}
++
++User Question: {query}
++
++Instructions:
++- Answer specifically for Indian context (INR, Indian tax laws, Indian banks/services)
++- Reference specific tax sections (80C, 80D, etc.) when relevant
++- Give actionable, practical advice
++- Keep the response concise but comprehensive
++- If the question is about their spending, reference the financial summary above"""
+     
+-    try:
+-        response = client.chat.completions.create(
+-            model="gpt-3.5-turbo",
+-            messages=[{"role": "user", "content": prompt}]
+-        )
+-        return response.choices[0].message.content
+-    except Exception as e:
+-        return str(e)
++    response = generate_chat_completion(
++        system_prompt="You are FinAssist, an expert Indian personal finance AI assistant.",
++        user_prompt=prompt,
++        temperature=0.3,
++    )
++
++    if response:
++        return response
++
++    if kb_context:
++        return f"Based on our knowledge base:\n{kb_context}\n\n(AI provider unavailable; returning retrieved context.)"
++    return "I am unable to connect to the AI service. Please check your LLM provider configuration."
++
+diff --git a/FinAssist/backend/app/agents/tax_agent.py b/FinAssist/backend/app/agents/tax_agent.py
+index 4ecb54c..ec2ebca 100644
+--- a/FinAssist/backend/app/agents/tax_agent.py
++++ b/FinAssist/backend/app/agents/tax_agent.py
+@@ -1,40 +1,68 @@
+ import json
+-from openai import OpenAI
+-from app.config import OPENAI_API_KEY
+ from app.services.rag_service import rag_service
++from app.services.llm_service import generate_json_completion
+ 
+-client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
++# Rule-based tax deduction map for Indian context
++TAX_RULES_MAP = {
++    "Insurance": {"is_tax_deductible": True, "tax_category": "Section 80C / 80D", "reasoning": "Insurance premiums are deductible under 80C (life) or 80D (health)"},
++    "Healthcare": {"is_tax_deductible": True, "tax_category": "Section 80D", "reasoning": "Medical expenses and health insurance qualify under Section 80D"},
++    "Education": {"is_tax_deductible": True, "tax_category": "Section 80C / 80E", "reasoning": "Tuition fees under 80C, education loan interest under 80E"},
++    "Investment": {"is_tax_deductible": True, "tax_category": "Section 80C / 80CCD", "reasoning": "PPF, ELSS, NPS contributions qualify for tax deductions"},
++    "Rent": {"is_tax_deductible": True, "tax_category": "Section 10(13A) / 80GG", "reasoning": "House rent qualifies for HRA exemption or 80GG deduction"},
++    "EMI & Loans": {"is_tax_deductible": True, "tax_category": "Section 24(b) / 80E", "reasoning": "Home loan interest under 24(b), education loan under 80E"},
++}
+ 
+ def analyze_tax_deductibility(merchant: str, description: str, category: str) -> dict:
+-    """Determines if an expense is likely tax deductible based on the knowledge base."""
+-    # Step 1: Query RAG for relevant tax rules
+-    rag_results = rag_service.search(f"{merchant} {description} {category}", k=2)
+-    kb_context = "\n".join([res["document"] for res in rag_results])
++    """Determines if an expense is likely tax deductible using rules + RAG + LLM."""
+     
+-    if not client:
+-        return {"is_tax_deductible": False, "tax_category": None, "reasoning": "Mock"}
+-        
+-    prompt = f"""
+-    You are an AI Tax Advisor.
+-    Transaction:
+-    Merchant: {merchant}
+-    Description: {description}
+-    Category: {category}
++    # Step 1: Direct rule-based lookup
++    if category in TAX_RULES_MAP:
++        return TAX_RULES_MAP[category]
+     
+-    Knowledge Base excerpts:
+-    {kb_context}
++    # Step 2: Check keywords for common deductible items
++    text = f"{merchant} {description}".lower()
++    deductible_keywords = {
++        "donation": ("Section 80G", "Donations to eligible charities are deductible under 80G"),
++        "nps": ("Section 80CCD(1B)", "NPS contributions get additional Γé╣50,000 deduction"),
++        "ppf": ("Section 80C", "PPF contributions deductible up to Γé╣1.5 lakh"),
++        "elss": ("Section 80C", "ELSS mutual fund investments qualify under 80C"),
++        "lic": ("Section 80C", "Life insurance premiums deductible under 80C"),
++        "health insurance": ("Section 80D", "Health insurance premiums deductible under 80D"),
++        "home loan": ("Section 24(b)", "Home loan interest deductible up to Γé╣2 lakh"),
++    }
+     
+-    Determine if this transaction is likely tax-deductible.
+-    Return only valid JSON format:
+-    {{"is_tax_deductible": true/false, "tax_category": "section/category", "reasoning": "text"}}
+-    """
++    for keyword, (section, reason) in deductible_keywords.items():
++        if keyword in text:
++            return {"is_tax_deductible": True, "tax_category": section, "reasoning": reason}
+     
+-    try:
+-        response = client.chat.completions.create(
+-            model="gpt-3.5-turbo",
+-            messages=[{"role": "user", "content": prompt}],
+-            temperature=0.0
+-        )
+-        return json.loads(response.choices[0].message.content)
+-    except Exception as e:
+-        return {"is_tax_deductible": False, "tax_category": None, "reasoning": str(e)}
++    # Step 3: Use RAG + LLM for ambiguous cases
++    rag_results = rag_service.search(f"{merchant} {description} {category} tax deduction india", k=3)
++    kb_context = "\n".join([res["document"] for res in rag_results]) if rag_results else "No relevant tax rules found."
++    
++    prompt = f"""You are an Indian Tax Advisor AI.
++
++Transaction:
++- Merchant: {merchant}
++- Description: {description}
++- Category: {category}
++
++Relevant Tax Rules from Knowledge Base:
++{kb_context}
++
++Based on Indian Income Tax Act, determine if this is tax-deductible.
++Return ONLY valid JSON:
++{{"is_tax_deductible": true/false, "tax_category": "Section XX", "reasoning": "brief reason"}}"""
++    
++    result = generate_json_completion(
++        system_prompt="You are an expert Indian tax deduction assistant.",
++        user_prompt=prompt,
++        temperature=0.0,
++    )
++    if not result:
++        return {
++            "is_tax_deductible": False,
++            "tax_category": None,
++            "reasoning": "LLM unavailable; defaulting to conservative non-deductible decision",
++        }
++    return result
++
+diff --git a/FinAssist/backend/app/config.py b/FinAssist/backend/app/config.py
+index ec86eef..5b5a09f 100644
+--- a/FinAssist/backend/app/config.py
++++ b/FinAssist/backend/app/config.py
+@@ -1,11 +1,52 @@
++# config.py
+ import os
+ from dotenv import load_dotenv
+ 
+-# Load environment variables from .env file
+-load_dotenv()
++# Always load backend/.env regardless of current working directory.
++BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++ENV_FILE = os.path.join(BASE_DIR, ".env")
++load_dotenv(ENV_FILE)
+ 
+-# We expect OPENAI_API_KEY to be provided in the environment or .env file
+ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
++GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
++LLM_PROVIDER = os.getenv("LLM_PROVIDER", "openai").lower()
++OPENAI_CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-3.5-turbo")
++GEMINI_CHAT_MODEL = os.getenv("GEMINI_CHAT_MODEL", "gemini-1.5-flash")
++OLLAMA_API_BASE_URL = os.getenv("OLLAMA_API_BASE_URL", "http://localhost:11434")
++OLLAMA_CHAT_MODEL = os.getenv("OLLAMA_CHAT_MODEL", "mistral")
++WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "finassist-dev-secret")
++SMS_FORWARD_SECRET = os.getenv("SMS_FORWARD_SECRET", "")
++SMS_FORWARD_DEFAULT_USER_EMAIL = os.getenv("SMS_FORWARD_DEFAULT_USER_EMAIL", "")
++REPORT_LOOKBACK_DAYS = int(os.getenv("REPORT_LOOKBACK_DAYS", "30"))
+ 
+-# Using SQLite for the prototype as requested
+-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./finassist.db")
++JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "change-me-in-production")
++JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
++ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "10080"))
++AUTO_CREATE_TABLES = os.getenv("AUTO_CREATE_TABLES", "true").lower() == "true"
++LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
++RATE_LIMIT_BACKEND = os.getenv("RATE_LIMIT_BACKEND", "memory").lower()
++REDIS_URL = os.getenv("REDIS_URL", "")
++AUTO_CLASSIFICATION_ENABLED = os.getenv("AUTO_CLASSIFICATION_ENABLED", "true").lower() == "true"
++LANGGRAPH_CHECKPOINT_PATH = os.getenv(
++	"LANGGRAPH_CHECKPOINT_PATH",
++	os.path.join(BASE_DIR, "data", "langgraph_checkpoints.sqlite"),
++)
++
++CORS_ALLOWED_ORIGINS = os.getenv("CORS_ALLOWED_ORIGINS", "*")
++CORS_ALLOW_CREDENTIALS = os.getenv("CORS_ALLOW_CREDENTIALS", "true").lower() == "true"
++TRUSTED_HOSTS = os.getenv("TRUSTED_HOSTS", "*")
++SECURITY_HEADERS_ENABLED = os.getenv("SECURITY_HEADERS_ENABLED", "true").lower() == "true"
++REQUIRE_HTTPS = os.getenv("REQUIRE_HTTPS", "false").lower() == "true"
++
++# Optional provider keys for future integrations.
++TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
++TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
++TWILIO_FROM_NUMBER = os.getenv("TWILIO_FROM_NUMBER", "")
++MSG91_AUTH_KEY = os.getenv("MSG91_AUTH_KEY", "")
++FAST2SMS_API_KEY = os.getenv("FAST2SMS_API_KEY", "")
++RAZORPAY_KEY_ID = os.getenv("RAZORPAY_KEY_ID", "")
++RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET", "")
++STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "")
++
++# Fix: use absolute path so db location is consistent regardless of working directory
++DATABASE_URL = os.getenv("DATABASE_URL", f"sqlite:///{os.path.join(BASE_DIR, 'data', 'finassist.db')}")
+\ No newline at end of file
+diff --git a/FinAssist/backend/app/main.py b/FinAssist/backend/app/main.py
+index e58a32c..6ac5199 100644
+--- a/FinAssist/backend/app/main.py
++++ b/FinAssist/backend/app/main.py
+@@ -1,26 +1,174 @@
+-from fastapi import FastAPI
++import uuid
++import logging
++from contextlib import asynccontextmanager
++from time import perf_counter
++
++from fastapi import FastAPI, HTTPException, Request
+ from fastapi.middleware.cors import CORSMiddleware
+-from app.routers import transactions
++from fastapi.middleware.trustedhost import TrustedHostMiddleware
++from fastapi.responses import JSONResponse
++from sqlalchemy import inspect, text
++from app.routers import transactions, auth, analytics, chat, tax, realtime
+ from app.models.database import engine, Base
++from app.config import (
++    AUTO_CREATE_TABLES,
++    CORS_ALLOWED_ORIGINS,
++    CORS_ALLOW_CREDENTIALS,
++    REQUIRE_HTTPS,
++    SECURITY_HEADERS_ENABLED,
++    TRUSTED_HOSTS,
++)
++from app.services.logging_service import setup_logging
++from app.services.rag_service import rag_service
++from app.services.scheduler_service import start_scheduler, stop_scheduler
++
++setup_logging()
++logger = logging.getLogger("finassist.api")
++
++
++def _ensure_dev_schema_compatibility() -> None:
++    """Apply lightweight additive schema fixes for local SQLite dev DBs."""
++    inspector = inspect(engine)
++    if "user_feedback" not in inspector.get_table_names():
++        return
++
++    existing = {col["name"] for col in inspector.get_columns("user_feedback")}
++    statements = []
++    if "source_event_id" not in existing:
++        statements.append("ALTER TABLE user_feedback ADD COLUMN source_event_id INTEGER")
++    if "predicted_category" not in existing:
++        statements.append("ALTER TABLE user_feedback ADD COLUMN predicted_category VARCHAR")
++    if "reason_type" not in existing:
++        statements.append("ALTER TABLE user_feedback ADD COLUMN reason_type VARCHAR")
++    if "created_at" not in existing:
++        statements.append("ALTER TABLE user_feedback ADD COLUMN created_at DATETIME")
++
++    if not statements:
++        return
++
++    with engine.begin() as conn:
++        for stmt in statements:
++            conn.execute(text(stmt))
+ 
+-# Create DB tables
+-Base.metadata.create_all(bind=engine)
++if AUTO_CREATE_TABLES:
++    # Dev convenience; disable in production and rely on Alembic migrations.
++    Base.metadata.create_all(bind=engine)
++    _ensure_dev_schema_compatibility()
++
++
++def _split_csv(value: str) -> list[str]:
++    return [part.strip() for part in value.split(",") if part.strip()]
++
++
++allowed_origins = _split_csv(CORS_ALLOWED_ORIGINS) or ["*"]
++trusted_hosts = _split_csv(TRUSTED_HOSTS) or ["*"]
++allow_credentials = CORS_ALLOW_CREDENTIALS and allowed_origins != ["*"]
++
++
++@asynccontextmanager
++async def lifespan(_: FastAPI):
++    print("Initializing RAG Knowledge Base...")
++    rag_service.initialize_knowledge_base()
++    start_scheduler()
++    yield
++    stop_scheduler()
+ 
+ app = FastAPI(
+     title="FinAssist API",
+     description="Backend for the AI-powered personal financial assistant.",
+-    version="1.0.0"
++    version="1.0.0",
++    lifespan=lifespan,
+ )
+ 
+ app.add_middleware(
+     CORSMiddleware,
+-    allow_origins=["*"],  # Allows all origins for hackathon development
+-    allow_credentials=True,
++    allow_origins=allowed_origins,
++    allow_credentials=allow_credentials,
+     allow_methods=["*"],
+     allow_headers=["*"],
+ )
+ 
++if trusted_hosts != ["*"]:
++    app.add_middleware(TrustedHostMiddleware, allowed_hosts=trusted_hosts)
++
++app.include_router(auth.router, prefix="/api/auth", tags=["Auth"])
+ app.include_router(transactions.router, prefix="/api/transactions", tags=["Transactions"])
++app.include_router(analytics.router, prefix="/api/analytics", tags=["Analytics"])
++app.include_router(chat.router, prefix="/api/chat", tags=["Chat"])
++app.include_router(tax.router, prefix="/api/tax", tags=["Tax Intelligence"])
++app.include_router(realtime.router, prefix="/api/realtime", tags=["Realtime"])
++
++
++@app.middleware("http")
++async def request_id_middleware(request: Request, call_next):
++    request_id = request.headers.get("X-Request-ID", str(uuid.uuid4()))
++    request.state.request_id = request_id
++
++    start = perf_counter()
++    method = request.method
++    path = request.url.path
++
++    try:
++        response = await call_next(request)
++    except Exception:
++        duration_ms = round((perf_counter() - start) * 1000.0, 2)
++        logger.exception(
++            "Request failed",
++            extra={
++                "request_id": request_id,
++                "method": method,
++                "path": path,
++                "duration_ms": duration_ms,
++            },
++        )
++        raise
++
++    duration_ms = round((perf_counter() - start) * 1000.0, 2)
++    logger.info(
++        "Request completed",
++        extra={
++            "request_id": request_id,
++            "method": method,
++            "path": path,
++            "status_code": response.status_code,
++            "duration_ms": duration_ms,
++        },
++    )
++    response.headers["X-Request-ID"] = request_id
++
++    if SECURITY_HEADERS_ENABLED:
++        response.headers.setdefault("X-Content-Type-Options", "nosniff")
++        response.headers.setdefault("X-Frame-Options", "DENY")
++        response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
++        response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
++        response.headers.setdefault("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'")
++        if REQUIRE_HTTPS:
++            response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
++
++    return response
++
++
++@app.exception_handler(HTTPException)
++async def http_exception_handler(request: Request, exc: HTTPException):
++    return JSONResponse(
++        status_code=exc.status_code,
++        content={
++            "detail": exc.detail,
++            "request_id": getattr(request.state, "request_id", None),
++        },
++        headers=exc.headers,
++    )
++
++
++@app.exception_handler(Exception)
++async def unhandled_exception_handler(request: Request, _: Exception):
++    return JSONResponse(
++        status_code=500,
++        content={
++            "detail": "Internal server error",
++            "request_id": getattr(request.state, "request_id", None),
++        },
++    )
+ 
+ @app.get("/")
+ def read_root():
+@@ -28,4 +176,37 @@ def read_root():
+ 
+ @app.get("/health")
+ def health_check():
+-    return {"status": "ok"}
++    return {
++        "status": "ok",
++        "service": "finassist-backend",
++    }
++
++
++@app.get("/health/ready")
++def readiness_check():
++    db_ok = True
++    db_error = None
++    try:
++        with engine.connect() as conn:
++            conn.execute(text("SELECT 1"))
++    except Exception as exc:  # pragma: no cover - defensive readiness check
++        db_ok = False
++        db_error = str(exc)
++
++    payload = {
++        "status": "ready" if db_ok else "not_ready",
++        "checks": {
++            "database": {
++                "ok": db_ok,
++                "error": db_error,
++            },
++            "rag_index": {
++                "ok": True,
++                "documents_indexed": int(getattr(rag_service.index, "ntotal", 0)),
++            },
++        },
++    }
++
++    if not db_ok:
++        return JSONResponse(status_code=503, content=payload)
++    return payload
+diff --git a/FinAssist/backend/app/models/schemas.py b/FinAssist/backend/app/models/schemas.py
+index dbe18f6..e0ca23d 100644
+--- a/FinAssist/backend/app/models/schemas.py
++++ b/FinAssist/backend/app/models/schemas.py
+@@ -1,12 +1,25 @@
+-from sqlalchemy import Column, Integer, String, Float, DateTime, Boolean
++from sqlalchemy import Boolean, Column, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
++from sqlalchemy.orm import relationship
+ from app.models.database import Base
+-from datetime import datetime
++from app.utils.time import utcnow
++
++class User(Base):
++    __tablename__ = "users"
++
++    id = Column(Integer, primary_key=True, index=True)
++    email = Column(String, unique=True, index=True, nullable=False)
++    hashed_password = Column(String, nullable=False)
++    
++    transactions = relationship("Transaction", back_populates="owner")
++    pending_events = relationship("RealtimeTransactionEvent", back_populates="owner")
++    notifications = relationship("UserNotification", back_populates="owner")
+ 
+ class Transaction(Base):
+     __tablename__ = "transactions"
+ 
+     id = Column(Integer, primary_key=True, index=True)
+-    date = Column(DateTime, default=datetime.utcnow)
++    user_id = Column(Integer, ForeignKey("users.id"))
++    date = Column(DateTime, default=utcnow)
+     amount = Column(Float, nullable=False)
+     merchant = Column(String, index=True)
+     description = Column(String)
+@@ -19,10 +32,57 @@ class Transaction(Base):
+     is_tax_deductible = Column(Boolean, default=False)
+     tax_category = Column(String, nullable=True)
+ 
++    owner = relationship("User", back_populates="transactions")
++
+ class UserFeedback(Base):
+     __tablename__ = "user_feedback"
+     
+     id = Column(Integer, primary_key=True, index=True)
+     transaction_id = Column(Integer, index=True)
++    source_event_id = Column(Integer, ForeignKey("realtime_transaction_events.id"), nullable=True, index=True)
++    predicted_category = Column(String, nullable=True)
+     corrected_category = Column(String)
+     corrected_tax_status = Column(Boolean)
++    reason_type = Column(String, nullable=True)
++    created_at = Column(DateTime, default=utcnow, nullable=False)
++
++
++class RealtimeTransactionEvent(Base):
++    __tablename__ = "realtime_transaction_events"
++    __table_args__ = (
++        UniqueConstraint("user_id", "provider", "external_txn_id", name="uq_realtime_user_provider_external"),
++    )
++
++    id = Column(Integer, primary_key=True, index=True)
++    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
++    provider = Column(String, nullable=False, index=True)
++    external_txn_id = Column(String, nullable=False, index=True)
++    amount = Column(Float, nullable=False)
++    merchant = Column(String, nullable=False)
++    description = Column(String, nullable=True)
++    txn_date = Column(DateTime, default=utcnow, nullable=False)
++    status = Column(String, default="pending", nullable=False, index=True)
++    suggested_categories = Column(Text, nullable=False)
++    selected_category = Column(String, nullable=True)
++    confidence_score = Column(Float, nullable=True)
++    reminder_count = Column(Integer, default=0, nullable=False)
++    last_notified_at = Column(DateTime, nullable=True)
++    created_at = Column(DateTime, default=utcnow, nullable=False)
++    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow, nullable=False)
++
++    owner = relationship("User", back_populates="pending_events")
++
++
++class UserNotification(Base):
++    __tablename__ = "user_notifications"
++
++    id = Column(Integer, primary_key=True, index=True)
++    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
++    notification_type = Column(String, nullable=False, index=True)
++    title = Column(String, nullable=False)
++    message = Column(Text, nullable=False)
++    payload = Column(Text, nullable=True)
++    is_read = Column(Boolean, default=False, nullable=False)
++    created_at = Column(DateTime, default=utcnow, nullable=False)
++
++    owner = relationship("User", back_populates="notifications")
+diff --git a/FinAssist/backend/app/routers/transactions.py b/FinAssist/backend/app/routers/transactions.py
+index 4a4f9f0..05f9199 100644
+--- a/FinAssist/backend/app/routers/transactions.py
++++ b/FinAssist/backend/app/routers/transactions.py
+@@ -4,8 +4,9 @@ from typing import List
+ import os
+ 
+ from app.models.database import get_db
+-from app.models.schemas import Transaction
++from app.models.schemas import Transaction, User
+ from app.schemas.transaction import TransactionResponse
++from app.services.auth_service import get_current_user
+ from app.services.ingestion_service import parse_csv_transactions
+ from app.agents.expense_agent import classify_expense
+ from app.agents.tax_agent import analyze_tax_deductibility
+@@ -13,7 +14,7 @@ from app.agents.tax_agent import analyze_tax_deductibility
+ router = APIRouter()
+ 
+ @router.post("/upload", response_model=List[TransactionResponse])
+-async def upload_transactions(file: UploadFile = File(...), db: Session = Depends(get_db)):
++async def upload_transactions(file: UploadFile = File(...), db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+     file_location = f"temp_{file.filename}"
+     with open(file_location, "wb+") as file_object:
+         file_object.write(file.file.read())
+@@ -31,6 +32,7 @@ async def upload_transactions(file: UploadFile = File(...), db: Session = Depend
+         tax_info = analyze_tax_deductibility(p_txn.merchant, p_txn.description, category)
+         
+         db_txn = Transaction(
++            user_id=current_user.id,
+             date=p_txn.date,
+             amount=p_txn.amount,
+             merchant=p_txn.merchant,
+@@ -48,5 +50,5 @@ async def upload_transactions(file: UploadFile = File(...), db: Session = Depend
+     return saved_transactions
+ 
+ @router.get("/", response_model=List[TransactionResponse])
+-def get_transactions(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
+-    return db.query(Transaction).offset(skip).limit(limit).all()
++def get_transactions(skip: int = 0, limit: int = 100, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
++    return db.query(Transaction).filter(Transaction.user_id == current_user.id).offset(skip).limit(limit).all()
+diff --git a/FinAssist/backend/app/schemas/transaction.py b/FinAssist/backend/app/schemas/transaction.py
+index cb7c051..c5c8cb8 100644
+--- a/FinAssist/backend/app/schemas/transaction.py
++++ b/FinAssist/backend/app/schemas/transaction.py
+@@ -13,6 +13,7 @@ class TransactionCreate(TransactionBase):
+ 
+ class TransactionResponse(TransactionBase):
+     id: int
++    user_id: int
+     category: Optional[str] = None
+     confidence_score: Optional[float] = None
+     is_tax_deductible: bool
+diff --git a/FinAssist/backend/app/services/ingestion_service.py b/FinAssist/backend/app/services/ingestion_service.py
+index 1987532..86c2f51 100644
+--- a/FinAssist/backend/app/services/ingestion_service.py
++++ b/FinAssist/backend/app/services/ingestion_service.py
+@@ -4,28 +4,46 @@ from app.schemas.transaction import TransactionCreate
+ 
+ def parse_csv_transactions(file_path: str) -> List[TransactionCreate]:
+     """
+-    Parses a CSV file containing transactions and normalizes them into TransactionCreate schemas.
+-    Expected columns: date, description, amount
++    Parses a CSV file containing transactions flexibly based on column names.
+     """
+     try:
+         df = pd.read_csv(file_path)
+-        # Normalize columns
+-        df.columns = [str(col).strip().lower() for col in df.columns]
++        # Normalize columns for easier matching
++        df.columns = [str(col).strip().lower().replace(' ', '_').replace('(', '').replace(')', '') for col in df.columns]
+         
+         transactions = []
++        
++        # Identify mapping
++        amt_col = next((c for c in df.columns if 'amount' in c or 'inr' in c), None)
++        date_col = next((c for c in df.columns if 'date' in c or 'time' in c), None)
++        merchant_col = next((c for c in df.columns if 'merchant' in c or 'party' in c or 'name' in c), None)
++        desc_col = next((c for c in df.columns if 'desc' in c or 'category' in c or 'type' in c), None)
++        
+         for _, row in df.iterrows():
+-            # Basic mapping logic - adjust based on actual CSV format
+-            amount = float(row.get('amount', 0))
++            amount = float(row.get(amt_col, 0)) if amt_col else 0.0
+             if amount < 0:
+-                amount = abs(amount)  # Store expenses as positive absolute values for simplicity
++                amount = abs(amount)
+                 
+-            desc = str(row.get('description', 'Unknown')).strip()
++            merchant = str(row.get(merchant_col, 'Unknown')).strip() if merchant_col else "Unknown"
++            desc = str(row.get(desc_col, '')).strip() if desc_col else "No description"
+             
++            # Use merchant as desc if desc is empty
++            if not desc or desc == 'nan':
++                 desc = merchant
++            if merchant == "Unknown" and desc != "No description":
++                 merchant = desc
++
++            date_val = row.get(date_col)
++            try:
++                dt = pd.to_datetime(date_val) if pd.notna(date_val) else pd.Timestamp.now()
++            except:
++                dt = pd.Timestamp.now()
++                
+             transaction = TransactionCreate(
+                 amount=amount,
+-                merchant=desc,
++                merchant=merchant,
+                 description=desc,
+-                date=pd.to_datetime(row.get('date', pd.Timestamp.now()))
++                date=dt
+             )
+             transactions.append(transaction)
+             
+diff --git a/FinAssist/backend/app/services/rag_service.py b/FinAssist/backend/app/services/rag_service.py
+index f66e35b..c563cf8 100644
+--- a/FinAssist/backend/app/services/rag_service.py
++++ b/FinAssist/backend/app/services/rag_service.py
+@@ -1,6 +1,9 @@
+ import faiss
+ import numpy as np
++import hashlib
++
+ from openai import OpenAI
++
+ from app.config import OPENAI_API_KEY
+ 
+ class RAGService:
+@@ -11,16 +14,34 @@ class RAGService:
+         
+         self.client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+ 
++    def _local_embedding(self, text: str) -> np.ndarray:
++        # Deterministic hashed bag-of-words embedding for offline mode.
++        vec = np.zeros(self.dimension, dtype=np.float32)
++        tokens = [t for t in text.lower().split() if t]
++        if not tokens:
++            return vec
++
++        for token in tokens:
++            digest = hashlib.sha256(token.encode("utf-8")).digest()
++            idx = int.from_bytes(digest[:4], "big") % self.dimension
++            vec[idx] += 1.0
++
++        norm = np.linalg.norm(vec)
++        if norm > 0:
++            vec = vec / norm
++        return vec
++
+     def get_embedding(self, text: str) -> np.ndarray:
+-        if not self.client:
+-            # Return dummy embedding if no key
+-            return np.random.rand(self.dimension).astype('float32')
+-            
+-        response = self.client.embeddings.create(
+-            model="text-embedding-3-small",
+-            input=text
+-        )
+-        return np.array(response.data[0].embedding, dtype=np.float32)
++        if self.client:
++            try:
++                response = self.client.embeddings.create(
++                    model="text-embedding-3-small",
++                    input=text
++                )
++                return np.array(response.data[0].embedding, dtype=np.float32)
++            except Exception:
++                pass
++        return self._local_embedding(text)
+ 
+     def add_document(self, text: str):
+         emb = self.get_embedding(text)
+@@ -43,4 +64,33 @@ class RAGService:
+                 })
+         return results
+ 
++    def initialize_knowledge_base(self):
++        import os
++        import pandas as pd
++        data_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "data")
++        
++        # Load tax rules
++        tax_path = os.path.join(data_dir, "tax_rules.csv")
++        if os.path.exists(tax_path):
++            try:
++                df = pd.read_csv(tax_path)
++                for _, row in df.iterrows():
++                    doc = f"Tax Rule - Category: {row.get('category')} Sub: {row.get('sub_category')} Section: {row.get('section')} Deductible: {row.get('deductible')} Desc: {row.get('description')} Conditions: {row.get('conditions')} Note: {row.get('limit_notes')}"
++                    self.add_document(doc)
++                print(f"Loaded {len(df)} tax rules into RAG.")
++            except Exception as e:
++                print(f"Failed to load tax rules: {e}")
++                
++        # Load FAQs
++        faq_path = os.path.join(data_dir, "financial_knowledge_base.csv")
++        if os.path.exists(faq_path):
++            try:
++                df = pd.read_csv(faq_path)
++                for _, row in df.iterrows():
++                    doc = f"FAQ - Q: {row.get('question')} A: {row.get('answer')} Tags: {row.get('tags')}"
++                    self.add_document(doc)
++                print(f"Loaded {len(df)} FAQs into RAG.")
++            except Exception as e:
++                print(f"Failed to load FAQs: {e}")
++
+ rag_service = RAGService()
+diff --git a/FinAssist/backend/requirements.txt b/FinAssist/backend/requirements.txt
+index d6bc0a6..b0a082b 100644
+--- a/FinAssist/backend/requirements.txt
++++ b/FinAssist/backend/requirements.txt
+@@ -3,6 +3,7 @@ uvicorn[standard]
+ sqlalchemy
+ pydantic
+ openai
++google-generativeai
+ faiss-cpu
+ scikit-learn
+ pandas
+@@ -11,3 +12,11 @@ python-multipart
+ python-dotenv
+ statsmodels
+ requests
++python-jose[cryptography]
++passlib
++apscheduler
++pytest
++alembic
++redis
++langgraph
++langgraph-checkpoint-sqlite
+diff --git a/FinAssist/frontend/package-lock.json b/FinAssist/frontend/package-lock.json
+index 253a882..3257747 100644
+--- a/FinAssist/frontend/package-lock.json
++++ b/FinAssist/frontend/package-lock.json
+@@ -13,6 +13,8 @@
+         "lucide-react": "^1.0.1",
+         "react": "^19.2.4",
+         "react-dom": "^19.2.4",
++        "react-hot-toast": "^2.6.0",
++        "react-router-dom": "^7.13.2",
+         "recharts": "^3.8.0"
+       },
+       "devDependencies": {
+@@ -58,6 +60,7 @@
+       "integrity": "sha512-CGOfOJqWjg2qW/Mb6zNsDm+u5vFQ8DxXfbM09z69p5Z6+mE1ikP2jUXw+j42Pf1XTYED2Rni5f95npYeuwMDQA==",
+       "dev": true,
+       "license": "MIT",
++      "peer": true,
+       "dependencies": {
+         "@babel/code-frame": "^7.29.0",
+         "@babel/generator": "^7.29.0",
+@@ -716,9 +719,6 @@
+         "arm64"
+       ],
+       "dev": true,
+-      "libc": [
+-        "glibc"
+-      ],
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -736,9 +736,6 @@
+         "arm64"
+       ],
+       "dev": true,
+-      "libc": [
+-        "musl"
+-      ],
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -756,9 +753,6 @@
+         "ppc64"
+       ],
+       "dev": true,
+-      "libc": [
+-        "glibc"
+-      ],
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -776,9 +770,6 @@
+         "s390x"
+       ],
+       "dev": true,
+-      "libc": [
+-        "glibc"
+-      ],
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -796,9 +787,6 @@
+         "x64"
+       ],
+       "dev": true,
+-      "libc": [
+-        "glibc"
+-      ],
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -816,9 +804,6 @@
+         "x64"
+       ],
+       "dev": true,
+-      "libc": [
+-        "musl"
+-      ],
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -1009,6 +994,7 @@
+       "integrity": "sha512-ilcTH/UniCkMdtexkoCN0bI7pMcJDvmQFPvuPvmEaYA/NSfFTAgdUSLAoVjaRJm7+6PvcM+q1zYOwS4wTYMF9w==",
+       "devOptional": true,
+       "license": "MIT",
++      "peer": true,
+       "dependencies": {
+         "csstype": "^3.2.2"
+       }
+@@ -1061,6 +1047,7 @@
+       "integrity": "sha512-UVJyE9MttOsBQIDKw1skb9nAwQuR5wuGD3+82K6JgJlm/Y+KI92oNsMNGZCYdDsVtRHSak0pcV5Dno5+4jh9sw==",
+       "dev": true,
+       "license": "MIT",
++      "peer": true,
+       "bin": {
+         "acorn": "bin/acorn"
+       },
+@@ -1186,6 +1173,7 @@
+         }
+       ],
+       "license": "MIT",
++      "peer": true,
+       "dependencies": {
+         "baseline-browser-mapping": "^2.9.0",
+         "caniuse-lite": "^1.0.30001759",
+@@ -1316,6 +1304,19 @@
+       "dev": true,
+       "license": "MIT"
+     },
++    "node_modules/cookie": {
++      "version": "1.1.1",
++      "resolved": "https://registry.npmjs.org/cookie/-/cookie-1.1.1.tgz",
++      "integrity": "sha512-ei8Aos7ja0weRpFzJnEA9UHJ/7XQmqglbRwnf2ATjcB9Wq874VKH9kfjjirM6UhU2/E5fFYadylyhFldcqSidQ==",
++      "license": "MIT",
++      "engines": {
++        "node": ">=18"
++      },
++      "funding": {
++        "type": "opencollective",
++        "url": "https://opencollective.com/express"
++      }
++    },
+     "node_modules/cross-spawn": {
+       "version": "7.0.6",
+       "resolved": "https://registry.npmjs.org/cross-spawn/-/cross-spawn-7.0.6.tgz",
+@@ -1335,8 +1336,8 @@
+       "version": "3.2.3",
+       "resolved": "https://registry.npmjs.org/csstype/-/csstype-3.2.3.tgz",
+       "integrity": "sha512-z1HGKcYy2xA8AGQfwrn0PAy+PB7X/GSj3UVJW9qKyn43xWa+gl5nXmU4qqLMRzWVLFC8KusUX8T/0kCiOYpAIQ==",
+-      "devOptional": true,
+-      "license": "MIT"
++      "license": "MIT",
++      "peer": true
+     },
+     "node_modules/d3-array": {
+       "version": "3.2.4",
+@@ -1614,6 +1615,7 @@
+       "integrity": "sha512-XoMjdBOwe/esVgEvLmNsD3IRHkm7fbKIUGvrleloJXUZgDHig2IPWNniv+GwjyJXzuNqVjlr5+4yVUZjycJwfQ==",
+       "dev": true,
+       "license": "MIT",
++      "peer": true,
+       "dependencies": {
+         "@eslint-community/eslint-utils": "^4.8.0",
+         "@eslint-community/regexpp": "^4.12.1",
+@@ -2048,6 +2050,15 @@
+         "url": "https://github.com/sponsors/sindresorhus"
+       }
+     },
++    "node_modules/goober": {
++      "version": "2.1.18",
++      "resolved": "https://registry.npmjs.org/goober/-/goober-2.1.18.tgz",
++      "integrity": "sha512-2vFqsaDVIT9Gz7N6kAL++pLpp41l3PfDuusHcjnGLfR6+huZkl6ziX+zgVC3ZxpqWhzH6pyDdGrCeDhMIvwaxw==",
++      "license": "MIT",
++      "peerDependencies": {
++        "csstype": "^3.0.10"
++      }
++    },
+     "node_modules/gopd": {
+       "version": "1.2.0",
+       "resolved": "https://registry.npmjs.org/gopd/-/gopd-1.2.0.tgz",
+@@ -2446,9 +2457,6 @@
+         "arm64"
+       ],
+       "dev": true,
+-      "libc": [
+-        "glibc"
+-      ],
+       "license": "MPL-2.0",
+       "optional": true,
+       "os": [
+@@ -2470,9 +2478,6 @@
+         "arm64"
+       ],
+       "dev": true,
+-      "libc": [
+-        "musl"
+-      ],
+       "license": "MPL-2.0",
+       "optional": true,
+       "os": [
+@@ -2494,9 +2499,6 @@
+         "x64"
+       ],
+       "dev": true,
+-      "libc": [
+-        "glibc"
+-      ],
+       "license": "MPL-2.0",
+       "optional": true,
+       "os": [
+@@ -2518,9 +2520,6 @@
+         "x64"
+       ],
+       "dev": true,
+-      "libc": [
+-        "musl"
+-      ],
+       "license": "MPL-2.0",
+       "optional": true,
+       "os": [
+@@ -2812,6 +2811,7 @@
+       "integrity": "sha512-QP88BAKvMam/3NxH6vj2o21R6MjxZUAd6nlwAS/pnGvN9IVLocLHxGYIzFhg6fUQ+5th6P4dv4eW9jX3DSIj7A==",
+       "dev": true,
+       "license": "MIT",
++      "peer": true,
+       "engines": {
+         "node": ">=12"
+       },
+@@ -2879,6 +2879,7 @@
+       "resolved": "https://registry.npmjs.org/react/-/react-19.2.4.tgz",
+       "integrity": "sha512-9nfp2hYpCwOjAN+8TZFGhtWEwgvWHXqESH8qT89AT/lWklpLON22Lc8pEtnpsZz7VmawabSU0gCjnj8aC0euHQ==",
+       "license": "MIT",
++      "peer": true,
+       "engines": {
+         "node": ">=0.10.0"
+       }
+@@ -2888,6 +2889,7 @@
+       "resolved": "https://registry.npmjs.org/react-dom/-/react-dom-19.2.4.tgz",
+       "integrity": "sha512-AXJdLo8kgMbimY95O2aKQqsz2iWi9jMgKJhRBAxECE4IFxfcazB2LmzloIoibJI3C12IlY20+KFaLv+71bUJeQ==",
+       "license": "MIT",
++      "peer": true,
+       "dependencies": {
+         "scheduler": "^0.27.0"
+       },
+@@ -2895,6 +2897,23 @@
+         "react": "^19.2.4"
+       }
+     },
++    "node_modules/react-hot-toast": {
++      "version": "2.6.0",
++      "resolved": "https://registry.npmjs.org/react-hot-toast/-/react-hot-toast-2.6.0.tgz",
++      "integrity": "sha512-bH+2EBMZ4sdyou/DPrfgIouFpcRLCJ+HoCA32UoAYHn6T3Ur5yfcDCeSr5mwldl6pFOsiocmrXMuoCJ1vV8bWg==",
++      "license": "MIT",
++      "dependencies": {
++        "csstype": "^3.1.3",
++        "goober": "^2.1.16"
++      },
++      "engines": {
++        "node": ">=10"
++      },
++      "peerDependencies": {
++        "react": ">=16",
++        "react-dom": ">=16"
++      }
++    },
+     "node_modules/react-is": {
+       "version": "19.2.4",
+       "resolved": "https://registry.npmjs.org/react-is/-/react-is-19.2.4.tgz",
+@@ -2907,6 +2926,7 @@
+       "resolved": "https://registry.npmjs.org/react-redux/-/react-redux-9.2.0.tgz",
+       "integrity": "sha512-ROY9fvHhwOD9ySfrF0wmvu//bKCQ6AeZZq1nJNtbDC+kk5DuSuNX/n6YWYF/SYy7bSba4D4FSz8DJeKY/S/r+g==",
+       "license": "MIT",
++      "peer": true,
+       "dependencies": {
+         "@types/use-sync-external-store": "^0.0.6",
+         "use-sync-external-store": "^1.4.0"
+@@ -2925,6 +2945,44 @@
+         }
+       }
+     },
++    "node_modules/react-router": {
++      "version": "7.13.2",
++      "resolved": "https://registry.npmjs.org/react-router/-/react-router-7.13.2.tgz",
++      "integrity": "sha512-tX1Aee+ArlKQP+NIUd7SE6Li+CiGKwQtbS+FfRxPX6Pe4vHOo6nr9d++u5cwg+Z8K/x8tP+7qLmujDtfrAoUJA==",
++      "license": "MIT",
++      "dependencies": {
++        "cookie": "^1.0.1",
++        "set-cookie-parser": "^2.6.0"
++      },
++      "engines": {
++        "node": ">=20.0.0"
++      },
++      "peerDependencies": {
++        "react": ">=18",
++        "react-dom": ">=18"
++      },
++      "peerDependenciesMeta": {
++        "react-dom": {
++          "optional": true
++        }
++      }
++    },
++    "node_modules/react-router-dom": {
++      "version": "7.13.2",
++      "resolved": "https://registry.npmjs.org/react-router-dom/-/react-router-dom-7.13.2.tgz",
++      "integrity": "sha512-aR7SUORwTqAW0JDeiWF07e9SBE9qGpByR9I8kJT5h/FrBKxPMS6TiC7rmVO+gC0q52Bx7JnjWe8Z1sR9faN4YA==",
++      "license": "MIT",
++      "dependencies": {
++        "react-router": "7.13.2"
++      },
++      "engines": {
++        "node": ">=20.0.0"
++      },
++      "peerDependencies": {
++        "react": ">=18",
++        "react-dom": ">=18"
++      }
++    },
+     "node_modules/recharts": {
+       "version": "3.8.0",
+       "resolved": "https://registry.npmjs.org/recharts/-/recharts-3.8.0.tgz",
+@@ -2959,7 +3017,8 @@
+       "version": "5.0.1",
+       "resolved": "https://registry.npmjs.org/redux/-/redux-5.0.1.tgz",
+       "integrity": "sha512-M9/ELqF6fy8FwmkpnF0S3YKOqMyoWJ4+CS5Efg2ct3oY9daQvd/Pc71FpGZsVsbl3Cpb+IIcjBDUnnyBdQbq4w==",
+-      "license": "MIT"
++      "license": "MIT",
++      "peer": true
+     },
+     "node_modules/redux-thunk": {
+       "version": "3.1.0",
+@@ -3043,6 +3102,12 @@
+         "semver": "bin/semver.js"
+       }
+     },
++    "node_modules/set-cookie-parser": {
++      "version": "2.7.2",
++      "resolved": "https://registry.npmjs.org/set-cookie-parser/-/set-cookie-parser-2.7.2.tgz",
++      "integrity": "sha512-oeM1lpU/UvhTxw+g3cIfxXHyJRc/uidd3yK1P242gzHds0udQBYzs3y8j4gCCW+ZJ7ad0yctld8RYO+bdurlvw==",
++      "license": "MIT"
++    },
+     "node_modules/shebang-command": {
+       "version": "2.0.0",
+       "resolved": "https://registry.npmjs.org/shebang-command/-/shebang-command-2.0.0.tgz",
+@@ -3222,6 +3287,7 @@
+       "integrity": "sha512-1gFhNi+bHhRE/qKZOJXACm6tX4bA3Isy9KuKF15AgSRuRazNBOJfdDemPBU16/mpMxApDPrWvZ08DcLPEoRnuA==",
+       "dev": true,
+       "license": "MIT",
++      "peer": true,
+       "dependencies": {
+         "lightningcss": "^1.32.0",
+         "picomatch": "^4.0.3",
+@@ -3346,6 +3412,7 @@
+       "integrity": "sha512-rftlrkhHZOcjDwkGlnUtZZkvaPHCsDATp4pGpuOOMDaTdDDXF91wuVDJoWoPsKX/3YPQ5fHuF3STjcYyKr+Qhg==",
+       "dev": true,
+       "license": "MIT",
++      "peer": true,
+       "funding": {
+         "url": "https://github.com/sponsors/colinhacks"
+       }
+diff --git a/FinAssist/frontend/package.json b/FinAssist/frontend/package.json
+index d126c23..33fc8a6 100644
+--- a/FinAssist/frontend/package.json
++++ b/FinAssist/frontend/package.json
+@@ -15,6 +15,8 @@
+     "lucide-react": "^1.0.1",
+     "react": "^19.2.4",
+     "react-dom": "^19.2.4",
++    "react-hot-toast": "^2.6.0",
++    "react-router-dom": "^7.13.2",
+     "recharts": "^3.8.0"
+   },
+   "devDependencies": {
+diff --git a/FinAssist/frontend/src/App.jsx b/FinAssist/frontend/src/App.jsx
+index b2bf2e8..53f6de6 100644
+--- a/FinAssist/frontend/src/App.jsx
++++ b/FinAssist/frontend/src/App.jsx
+@@ -1,121 +1,85 @@
+-import { useState } from 'react'
+-import reactLogo from './assets/react.svg'
+-import viteLogo from './assets/vite.svg'
+-import heroImg from './assets/hero.png'
+-import './App.css'
++import { lazy, Suspense } from 'react';
++import { BrowserRouter as Router, Routes, Route, Navigate } from 'react-router-dom';
++import { useAuth } from './context/useAuth';
++import Sidebar from './components/Sidebar';
+ 
+-function App() {
+-  const [count, setCount] = useState(0)
++const LoginPage = lazy(() => import('./pages/LoginPage'));
++const DashboardPage = lazy(() => import('./pages/DashboardPage'));
++const UploadPage = lazy(() => import('./pages/UploadPage'));
++const AnalyticsPage = lazy(() => import('./pages/AnalyticsPage'));
++const TaxPage = lazy(() => import('./pages/TaxPage'));
++const ChatPage = lazy(() => import('./pages/ChatPage'));
++const PendingPage = lazy(() => import('./pages/PendingPage'));
++
++// Protected Route Wrapper
++function ProtectedRoute({ children }) {
++  const { user, loading } = useAuth();
++  if (loading) return <div className="loading-center"><div className="spinner" /></div>;
++  if (!user) return <Navigate to="/login" replace />;
++  return children;
++}
+ 
++// Layout Wrapper
++function AppLayout({ children }) {
+   return (
+     <>
+-      <section id="center">
+-        <div className="hero">
+-          <img src={heroImg} className="base" width="170" height="179" alt="" />
+-          <img src={reactLogo} className="framework" alt="React logo" />
+-          <img src={viteLogo} className="vite" alt="Vite logo" />
+-        </div>
+-        <div>
+-          <h1>Get started</h1>
+-          <p>
+-            Edit <code>src/App.jsx</code> and save to test <code>HMR</code>
+-          </p>
+-        </div>
+-        <button
+-          className="counter"
+-          onClick={() => setCount((count) => count + 1)}
+-        >
+-          Count is {count}
+-        </button>
+-      </section>
+-
+-      <div className="ticks"></div>
++      <div className="animated-bg" />
++      <div className="app-layout">
++        <Sidebar />
++        <main className="main-content">
++          {children}
++        </main>
++      </div>
++    </>
++  );
++}
+ 
+-      <section id="next-steps">
+-        <div id="docs">
+-          <svg className="icon" role="presentation" aria-hidden="true">
+-            <use href="/icons.svg#documentation-icon"></use>
+-          </svg>
+-          <h2>Documentation</h2>
+-          <p>Your questions, answered</p>
+-          <ul>
+-            <li>
+-              <a href="https://vite.dev/" target="_blank">
+-                <img className="logo" src={viteLogo} alt="" />
+-                Explore Vite
+-              </a>
+-            </li>
+-            <li>
+-              <a href="https://react.dev/" target="_blank">
+-                <img className="button-icon" src={reactLogo} alt="" />
+-                Learn more
+-              </a>
+-            </li>
+-          </ul>
+-        </div>
+-        <div id="social">
+-          <svg className="icon" role="presentation" aria-hidden="true">
+-            <use href="/icons.svg#social-icon"></use>
+-          </svg>
+-          <h2>Connect with us</h2>
+-          <p>Join the Vite community</p>
+-          <ul>
+-            <li>
+-              <a href="https://github.com/vitejs/vite" target="_blank">
+-                <svg
+-                  className="button-icon"
+-                  role="presentation"
+-                  aria-hidden="true"
+-                >
+-                  <use href="/icons.svg#github-icon"></use>
+-                </svg>
+-                GitHub
+-              </a>
+-            </li>
+-            <li>
+-              <a href="https://chat.vite.dev/" target="_blank">
+-                <svg
+-                  className="button-icon"
+-                  role="presentation"
+-                  aria-hidden="true"
+-                >
+-                  <use href="/icons.svg#discord-icon"></use>
+-                </svg>
+-                Discord
+-              </a>
+-            </li>
+-            <li>
+-              <a href="https://x.com/vite_js" target="_blank">
+-                <svg
+-                  className="button-icon"
+-                  role="presentation"
+-                  aria-hidden="true"
+-                >
+-                  <use href="/icons.svg#x-icon"></use>
+-                </svg>
+-                X.com
+-              </a>
+-            </li>
+-            <li>
+-              <a href="https://bsky.app/profile/vite.dev" target="_blank">
+-                <svg
+-                  className="button-icon"
+-                  role="presentation"
+-                  aria-hidden="true"
+-                >
+-                  <use href="/icons.svg#bluesky-icon"></use>
+-                </svg>
+-                Bluesky
+-              </a>
+-            </li>
+-          </ul>
+-        </div>
+-      </section>
++function App() {
++  return (
++    <Router>
++      <Suspense fallback={<div className="loading-center"><div className="spinner" /></div>}>
++        <Routes>
++          <Route path="/login" element={<LoginPage />} />
++          
++          <Route path="/" element={
++            <ProtectedRoute>
++              <AppLayout><DashboardPage /></AppLayout>
++            </ProtectedRoute>
++          } />
++          
++          <Route path="/upload" element={
++            <ProtectedRoute>
++              <AppLayout><UploadPage /></AppLayout>
++            </ProtectedRoute>
++          } />
++          
++          <Route path="/analytics" element={
++            <ProtectedRoute>
++              <AppLayout><AnalyticsPage /></AppLayout>
++            </ProtectedRoute>
++          } />
++          
++          <Route path="/tax" element={
++            <ProtectedRoute>
++              <AppLayout><TaxPage /></AppLayout>
++            </ProtectedRoute>
++          } />
++          
++          <Route path="/chat" element={
++            <ProtectedRoute>
++              <AppLayout><ChatPage /></AppLayout>
++            </ProtectedRoute>
++          } />
+ 
+-      <div className="ticks"></div>
+-      <section id="spacer"></section>
+-    </>
+-  )
++          <Route path="/pending" element={
++            <ProtectedRoute>
++              <AppLayout><PendingPage /></AppLayout>
++            </ProtectedRoute>
++          } />
++        </Routes>
++      </Suspense>
++    </Router>
++  );
+ }
+ 
+-export default App
++export default App;
+diff --git a/FinAssist/frontend/src/index.css b/FinAssist/frontend/src/index.css
+index 2c84af0..aca4928 100644
+--- a/FinAssist/frontend/src/index.css
++++ b/FinAssist/frontend/src/index.css
+@@ -1,111 +1,473 @@
++@import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800;900&family=Space+Grotesk:wght@500;600;700&display=swap');
++
+ :root {
+-  --text: #6b6375;
+-  --text-h: #08060d;
+-  --bg: #fff;
+-  --border: #e5e4e7;
+-  --code-bg: #f4f3ec;
+-  --accent: #aa3bff;
+-  --accent-bg: rgba(170, 59, 255, 0.1);
+-  --accent-border: rgba(170, 59, 255, 0.5);
+-  --social-bg: rgba(244, 243, 236, 0.5);
+-  --shadow:
+-    rgba(0, 0, 0, 0.1) 0 10px 15px -3px, rgba(0, 0, 0, 0.05) 0 4px 6px -2px;
+-
+-  --sans: system-ui, 'Segoe UI', Roboto, sans-serif;
+-  --heading: system-ui, 'Segoe UI', Roboto, sans-serif;
+-  --mono: ui-monospace, Consolas, monospace;
+-
+-  font: 18px/145% var(--sans);
+-  letter-spacing: 0.18px;
+-  color-scheme: light dark;
+-  color: var(--text);
+-  background: var(--bg);
+-  font-synthesis: none;
+-  text-rendering: optimizeLegibility;
++  --primary: #6366f1; /* Indigo */
++  --primary-glow: rgba(99, 102, 241, 0.5);
++  --secondary: #ec4899; /* Pink */
++  --secondary-glow: rgba(236, 72, 153, 0.5);
++  --accent: #06b6d4; /* Cyan */
++  --accent-glow: rgba(6, 182, 212, 0.5);
++  
++  --success: #10b981;
++  --success-glow: rgba(16, 185, 129, 0.4);
++  --warning: #f59e0b;
++  --warning-glow: rgba(245, 158, 11, 0.4);
++  --danger: #ef4444;
++  --danger-glow: rgba(239, 68, 68, 0.4);
++
++  --bg-dark: #050505;
++  --bg-panel: rgba(15, 15, 20, 0.6);
++  --bg-panel-hover: rgba(25, 25, 35, 0.8);
++  
++  --border: rgba(255, 255, 255, 0.08);
++  --border-light: rgba(255, 255, 255, 0.15);
++  --border-glow: rgba(99, 102, 241, 0.3);
++  
++  --text-main: #ffffff;
++  --text-muted: #94a3b8;
++  --text-dark: #475569;
++
++  --glass-blur: blur(16px);
++  --shadow-neon: 0 0 20px var(--primary-glow), inset 0 0 10px rgba(255,255,255,0.05);
++  --shadow-elevation: 0 10px 40px rgba(0,0,0,0.8);
++  
++  --gradient-brand: linear-gradient(135deg, var(--primary) 0%, var(--secondary) 100%);
++  --gradient-glass: linear-gradient(135deg, rgba(255,255,255,0.05) 0%, rgba(255,255,255,0.01) 100%);
++}
++
++* { margin: 0; padding: 0; box-sizing: border-box; }
++
++body {
++  font-family: 'Outfit', sans-serif;
++  background-color: var(--bg-dark);
++  color: var(--text-main);
++  min-height: 100vh;
++  margin: 0;
+   -webkit-font-smoothing: antialiased;
+-  -moz-osx-font-smoothing: grayscale;
++  overflow-x: hidden;
++}
+ 
+-  @media (max-width: 1024px) {
+-    font-size: 16px;
+-  }
++/* Base Elements */
++h1, h2, h3, h4, h5, h6 { font-family: 'Space Grotesk', sans-serif; font-weight: 700; letter-spacing: -0.02em; }
++a { color: var(--accent); text-decoration: none; transition: 0.3s; }
++a:hover { color: var(--text-main); text-shadow: 0 0 10px var(--accent-glow); }
++
++/* --- 3D Animated Background --- */
++.animated-bg {
++  position: fixed;
++  top: 0; left: 0; right: 0; bottom: 0;
++  z-index: -1;
++  background: radial-gradient(circle at 50% 50%, #1a1a2e 0%, #000000 100%);
++  overflow: hidden;
+ }
+ 
+-@media (prefers-color-scheme: dark) {
+-  :root {
+-    --text: #9ca3af;
+-    --text-h: #f3f4f6;
+-    --bg: #16171d;
+-    --border: #2e303a;
+-    --code-bg: #1f2028;
+-    --accent: #c084fc;
+-    --accent-bg: rgba(192, 132, 252, 0.15);
+-    --accent-border: rgba(192, 132, 252, 0.5);
+-    --social-bg: rgba(47, 48, 58, 0.5);
+-    --shadow:
+-      rgba(0, 0, 0, 0.4) 0 10px 15px -3px, rgba(0, 0, 0, 0.25) 0 4px 6px -2px;
+-  }
++.animated-bg::before, .animated-bg::after {
++  content: '';
++  position: absolute;
++  width: 60vw;
++  height: 60vw;
++  border-radius: 50%;
++  filter: blur(100px);
++  opacity: 0.4;
++  animation: floatOrb 20s infinite ease-in-out alternate;
++}
+ 
+-  #social .button-icon {
+-    filter: invert(1) brightness(2);
+-  }
++.animated-bg::before {
++  background: radial-gradient(circle, var(--primary) 0%, transparent 70%);
++  top: -20%; left: -10%;
+ }
+ 
+-body {
+-  margin: 0;
++.animated-bg::after {
++  background: radial-gradient(circle, var(--secondary) 0%, transparent 70%);
++  bottom: -20%; right: -10%;
++  animation-delay: -10s;
+ }
+ 
+-#root {
+-  width: 1126px;
+-  max-width: 100%;
+-  margin: 0 auto;
+-  text-align: center;
+-  border-inline: 1px solid var(--border);
+-  min-height: 100svh;
++@keyframes floatOrb {
++  0% { transform: translate(0, 0) scale(1); }
++  50% { transform: translate(10%, 10%) scale(1.1); }
++  100% { transform: translate(-5%, 15%) scale(0.9); }
++}
++
++/* Layout */
++.app-layout { display: flex; min-height: 100vh; position: relative; z-index: 1; }
++
++.sidebar {
++  width: 280px;
++  background: var(--bg-panel);
++  backdrop-filter: var(--glass-blur);
++  -webkit-backdrop-filter: var(--glass-blur);
++  border-right: 1px solid var(--border);
++  padding: 32px 24px;
+   display: flex;
+   flex-direction: column;
+-  box-sizing: border-box;
++  position: fixed;
++  height: 100vh;
++  z-index: 10;
++  box-shadow: 10px 0 30px rgba(0,0,0,0.5);
++}
++
++.sidebar-logo {
++  font-family: 'Space Grotesk', sans-serif;
++  font-size: 28px;
++  font-weight: 800;
++  background: var(--gradient-brand);
++  -webkit-background-clip: text;
++  -webkit-text-fill-color: transparent;
++  margin-bottom: 4px;
++  filter: drop-shadow(0 0 8px var(--primary-glow));
++}
++
++.sidebar-subtitle {
++  font-size: 13px;
++  color: var(--text-muted);
++  margin-bottom: 40px;
++  text-transform: uppercase;
++  letter-spacing: 2px;
++  font-weight: 600;
++}
++
++.sidebar-nav { display: flex; flex-direction: column; gap: 8px; flex: 1; }
++
++.nav-link {
++  display: flex;
++  align-items: center;
++  gap: 14px;
++  padding: 14px 18px;
++  border-radius: 12px;
++  color: var(--text-muted);
++  font-size: 15px;
++  font-weight: 600;
++  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
++  cursor: pointer;
++  border: 1px solid transparent;
++  background: transparent;
++  width: 100%;
++  text-align: left;
++}
++
++.nav-link:hover { 
++  background: var(--bg-panel-hover); 
++  color: var(--text-main);
++  border-color: var(--border-light);
++  transform: translateX(4px);
++}
++
++.nav-link.active { 
++  background: rgba(99, 102, 241, 0.15); 
++  color: var(--text-main); 
++  border-color: rgba(99, 102, 241, 0.3);
++  box-shadow: inset 0 0 20px rgba(99, 102, 241, 0.1);
++}
++
++.nav-link.active svg { color: var(--primary); filter: drop-shadow(0 0 5px var(--primary)); }
++.nav-link svg { width: 22px; height: 22px; transition: 0.3s; }
++
++.sidebar-footer {
++  padding-top: 24px;
++  border-top: 1px solid var(--border);
++  margin-top: auto;
++}
++
++.user-info {
++  display: flex;
++  align-items: center;
++  gap: 12px;
++  padding: 12px;
++  background: rgba(0,0,0,0.3);
++  border-radius: 12px;
++  border: 1px solid var(--border);
++  margin-bottom: 12px;
+ }
+ 
+-h1,
+-h2 {
+-  font-family: var(--heading);
+-  font-weight: 500;
+-  color: var(--text-h);
++.user-avatar {
++  width: 36px;
++  height: 36px;
++  border-radius: 10px;
++  background: var(--gradient-brand);
++  display: flex;
++  align-items: center;
++  justify-content: center;
++  font-weight: 800;
++  font-size: 16px;
++  color: white;
++  box-shadow: 0 0 10px var(--primary-glow);
++}
++
++.main-content {
++  flex: 1;
++  margin-left: 280px;
++  padding: 40px 48px;
++  min-height: 100vh;
++}
++
++.page-header { margin-bottom: 40px; }
++.page-title { font-size: 36px; margin-bottom: 8px; text-shadow: 0 0 20px rgba(255,255,255,0.1); }
++.page-subtitle { color: var(--text-muted); font-size: 16px; font-weight: 400; }
++
++/* 3D Glass Cards */
++.card {
++  background: var(--bg-panel);
++  backdrop-filter: var(--glass-blur);
++  -webkit-backdrop-filter: var(--glass-blur);
++  border: 1px solid var(--border);
++  border-top: 1px solid rgba(255,255,255,0.15); /* Reflective highlight */
++  border-radius: 20px;
++  padding: 32px;
++  box-shadow: var(--shadow-elevation);
++  transition: all 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275);
++  position: relative;
++  overflow: hidden;
+ }
+ 
+-h1 {
+-  font-size: 56px;
+-  letter-spacing: -1.68px;
+-  margin: 32px 0;
+-  @media (max-width: 1024px) {
+-    font-size: 36px;
+-    margin: 20px 0;
+-  }
++.card::before {
++  content: '';
++  position: absolute;
++  top: 0; left: 0; right: 0; bottom: 0;
++  background: var(--gradient-glass);
++  pointer-events: none;
+ }
+-h2 {
++
++.card:hover { 
++  transform: translateY(-5px); 
++  border-color: var(--border-glow);
++  box-shadow: 0 15px 40px rgba(0,0,0,0.8), 0 0 20px var(--primary-glow);
++}
++
++.card-title {
++  font-family: 'Space Grotesk', sans-serif;
++  font-size: 15px;
++  color: var(--text-muted);
++  text-transform: uppercase;
++  letter-spacing: 1px;
++  margin-bottom: 12px;
++}
++
++/* Stat Grid */
++.stat-grid {
++  display: grid;
++  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
++  gap: 24px;
++  margin-bottom: 32px;
++}
++
++.stat-card {
++  background: var(--bg-panel);
++  backdrop-filter: var(--glass-blur);
++  border: 1px solid var(--border);
++  border-radius: 20px;
++  padding: 24px;
++  position: relative;
++  overflow: hidden;
++  box-shadow: var(--shadow-elevation);
++  transition: 0.3s;
++}
++
++.stat-card:hover { transform: scale(1.02); }
++
++/* Glowing Top Border Lines */
++.stat-card::after {
++  content: '';
++  position: absolute;
++  top: 0; left: 0; right: 0;
++  height: 4px;
++}
++
++.stat-card.blue::after { background: var(--primary); box-shadow: 0 0 15px var(--primary); }
++.stat-card.green::after { background: var(--success); box-shadow: 0 0 15px var(--success); }
++.stat-card.yellow::after { background: var(--warning); box-shadow: 0 0 15px var(--warning); }
++.stat-card.red::after { background: var(--danger); box-shadow: 0 0 15px var(--danger); }
++
++.stat-icon {
++  width: 48px;
++  height: 48px;
++  border-radius: 14px;
++  display: flex;
++  align-items: center;
++  justify-content: center;
++  margin-bottom: 16px;
+   font-size: 24px;
+-  line-height: 118%;
+-  letter-spacing: -0.24px;
+-  margin: 0 0 8px;
+-  @media (max-width: 1024px) {
+-    font-size: 20px;
+-  }
+-}
+-p {
+-  margin: 0;
+ }
+ 
+-code,
+-.counter {
+-  font-family: var(--mono);
++.stat-icon.blue { background: rgba(99, 102, 241, 0.15); color: var(--primary); box-shadow: inset 0 0 10px var(--primary-glow); }
++.stat-icon.green { background: rgba(16, 185, 129, 0.15); color: var(--success); box-shadow: inset 0 0 10px var(--success-glow); }
++.stat-icon.yellow { background: rgba(245, 158, 11, 0.15); color: var(--warning); box-shadow: inset 0 0 10px var(--warning-glow); }
++.stat-icon.red { background: rgba(239, 68, 68, 0.15); color: var(--danger); box-shadow: inset 0 0 10px var(--danger-glow); }
++
++.stat-label { font-size: 14px; color: var(--text-muted); margin-bottom: 8px; font-weight: 500; }
++.stat-value { font-family: 'Space Grotesk', sans-serif; font-size: 32px; font-weight: 800; text-shadow: 0 2px 10px rgba(0,0,0,0.5); }
++
++/* Grid layouts */
++.grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; margin-bottom: 32px; }
++
++/* Premium Buttons */
++.btn {
++  padding: 12px 24px;
++  border-radius: 12px;
++  font-weight: 700;
++  font-size: 15px;
++  font-family: 'Outfit', sans-serif;
++  cursor: pointer;
++  border: none;
++  transition: all 0.3s ease;
+   display: inline-flex;
+-  border-radius: 4px;
+-  color: var(--text-h);
++  align-items: center;
++  gap: 10px;
++  position: relative;
++  overflow: hidden;
++  z-index: 1;
++}
++
++.btn-primary {
++  background: var(--gradient-brand);
++  color: white;
++  box-shadow: 0 4px 15px var(--primary-glow);
++}
++
++.btn-primary::before {
++  content: '';
++  position: absolute;
++  top: 0; left: 0; right: 0; bottom: 0;
++  background: linear-gradient(135deg, var(--secondary) 0%, var(--primary) 100%);
++  z-index: -1;
++  opacity: 0;
++  transition: 0.3s;
+ }
+ 
+-code {
++.btn-primary:hover::before { opacity: 1; }
++.btn-primary:hover { transform: translateY(-2px); box-shadow: 0 8px 25px var(--primary-glow); }
++
++/* Premium Inputs */
++.input-group { margin-bottom: 24px; }
++.input-group label {
++  display: block;
++  font-size: 14px;
++  color: var(--text-muted);
++  margin-bottom: 8px;
++  font-weight: 600;
++  letter-spacing: 0.5px;
++}
++
++.input {
++  width: 100%;
++  padding: 14px 20px;
++  background: rgba(0,0,0,0.5);
++  border: 1px solid var(--border);
++  border-radius: 12px;
++  color: white;
+   font-size: 15px;
+-  line-height: 135%;
+-  padding: 4px 8px;
+-  background: var(--code-bg);
++  font-family: 'Outfit', sans-serif;
++  transition: 0.3s;
++  box-shadow: inset 0 2px 5px rgba(0,0,0,0.5);
+ }
++
++.input:focus { 
++  outline: none; 
++  border-color: var(--primary); 
++  background: rgba(15, 15, 25, 0.8);
++  box-shadow: 0 0 0 3px var(--primary-glow), inset 0 2px 5px rgba(0,0,0,0.5); 
++}
++
++/* Auth Pages */
++.auth-container {
++  min-height: 100vh;
++  display: flex;
++  align-items: center;
++  justify-content: center;
++  position: relative;
++  z-index: 1;
++}
++
++.auth-card {
++  width: 460px;
++  background: var(--bg-panel);
++  backdrop-filter: var(--glass-blur);
++  border: 1px solid var(--border);
++  border-top: 1px solid rgba(255,255,255,0.2);
++  border-radius: 24px;
++  padding: 48px;
++  box-shadow: var(--shadow-elevation), 0 0 40px rgba(99, 102, 241, 0.1);
++  position: relative;
++}
++
++.auth-card::before {
++  content: '';
++  position: absolute;
++  top: -2px; left: -2px; right: -2px; bottom: -2px;
++  background: var(--gradient-brand);
++  z-index: -1;
++  border-radius: 26px;
++  opacity: 0.3;
++  filter: blur(10px);
++}
++
++/* Upload Zone */
++.upload-zone {
++  border: 2px dashed rgba(255,255,255,0.2);
++  border-radius: 20px;
++  padding: 60px;
++  text-align: center;
++  cursor: pointer;
++  transition: 0.3s;
++  background: rgba(0,0,0,0.2);
++}
++
++.upload-zone:hover { 
++  border-color: var(--primary); 
++  background: rgba(99,102,241,0.05); 
++  box-shadow: 0 0 20px rgba(99,102,241,0.1) inset;
++}
++
++/* Badges */
++.badge {
++  display: inline-flex;
++  align-items: center;
++  padding: 6px 12px;
++  border-radius: 20px;
++  font-size: 12px;
++  font-weight: 700;
++  letter-spacing: 0.5px;
++  text-transform: uppercase;
++}
++
++/* Chat */
++.chat-container { display: flex; flex-direction: column; height: calc(100vh - 180px); }
++.chat-bubble {
++  padding: 16px 20px;
++  border-radius: 16px;
++  font-size: 15px;
++  line-height: 1.6;
++  max-width: 80%;
++  box-shadow: var(--shadow-elevation);
++}
++.chat-bubble.user {
++  background: var(--gradient-brand);
++  color: white;
++  align-self: flex-end;
++  border-bottom-right-radius: 4px;
++}
++.chat-bubble.bot {
++  background: var(--bg-panel);
++  border: 1px solid var(--border);
++  color: white;
++  align-self: flex-start;
++  border-bottom-left-radius: 4px;
++}
++
++/* Utilities */
++.spinner {
++  width: 40px; height: 40px;
++  border: 3px solid rgba(255,255,255,0.1);
++  border-top-color: var(--primary);
++  border-radius: 50%;
++  animation: spin 0.8s linear infinite;
++}
++@keyframes spin { to { transform: rotate(360deg); } }
++.loading-center { display: flex; align-items: center; justify-content: center; min-height: 200px; }
++
++/* Tables */
++table { width: 100%; border-collapse: collapse; }
++th { padding: 16px; text-align: left; font-size: 13px; font-weight: 700; color: var(--text-muted); text-transform: uppercase; background: rgba(0,0,0,0.4); border-bottom: 2px solid var(--border); }
++td { padding: 16px; font-size: 15px; border-bottom: 1px solid var(--border); color: var(--text-main); }
++tr:hover td { background: rgba(255,255,255,0.02); }
++
+diff --git a/FinAssist/frontend/src/main.jsx b/FinAssist/frontend/src/main.jsx
+index 54b39dd..deca716 100644
+--- a/FinAssist/frontend/src/main.jsx
++++ b/FinAssist/frontend/src/main.jsx
+@@ -1,10 +1,15 @@
+-import React from 'react'
+-import ReactDOM from 'react-dom/client'
++import { StrictMode } from 'react'
++import { createRoot } from 'react-dom/client'
++import { Toaster } from 'react-hot-toast'
+ import App from './App.jsx'
++import { AuthProvider } from './context/AuthContext'
+ import './index.css'
+ 
+-ReactDOM.createRoot(document.getElementById('root')).render(
+-  <React.StrictMode>
+-    <App />
+-  </React.StrictMode>,
++createRoot(document.getElementById('root')).render(
++  <StrictMode>
++    <AuthProvider>
++      <App />
++      <Toaster position="top-right" />
++    </AuthProvider>
++  </StrictMode>,
+ )
+diff --git a/FinAssist/frontend/vite.config.js b/FinAssist/frontend/vite.config.js
+index 8b0f57b..602193b 100644
+--- a/FinAssist/frontend/vite.config.js
++++ b/FinAssist/frontend/vite.config.js
+@@ -4,4 +4,25 @@ import react from '@vitejs/plugin-react'
+ // https://vite.dev/config/
+ export default defineConfig({
+   plugins: [react()],
++  build: {
++    rollupOptions: {
++      output: {
++        manualChunks(id) {
++          if (id.includes('node_modules/react') || id.includes('react-router-dom')) {
++            return 'react-vendor'
++          }
++          if (id.includes('node_modules/recharts')) {
++            return 'charts-vendor'
++          }
++          if (id.includes('node_modules/framer-motion')) {
++            return 'motion-vendor'
++          }
++          if (id.includes('node_modules/lucide-react')) {
++            return 'icons-vendor'
++          }
++          return undefined
++        },
++      },
++    },
++  },
+ })
+diff --git a/README.md b/README.md
+index 8e546ad..b26c875 100644
+--- a/README.md
++++ b/README.md
+@@ -31,16 +31,85 @@ cd FinAssist/backend
+ python -m venv venv
+ .\venv\Scripts\activate
+ pip install -r requirements.txt
++copy .env.example .env
+ uvicorn app.main:app --reload --port 8000
+ ```
+ > **Important:** Set an `OPENAI_API_KEY` in `FinAssist/backend/.env` to experience the full AI conversational and classification engine. If no key is present, the app safely overrides to mock data for a seamless demonstration.
+ 
++LLM provider switch in backend `.env`:
++- `LLM_PROVIDER=openai` (default)
++- `LLM_PROVIDER=gemini`
++- Then set matching provider key (`OPENAI_API_KEY` or `GEMINI_API_KEY`).
++
++Backend `.env` now includes sections for:
++- Core app settings (`DATABASE_URL`, `WEBHOOK_SECRET`, `REPORT_LOOKBACK_DAYS`)
++- OpenAI (`OPENAI_API_KEY`)
++- SMS providers (Twilio / MSG91 / Fast2SMS)
++- Payment gateways (Razorpay / Stripe)
++- Account Aggregator/FIU placeholders
++- Dev bootstrap control (`AUTO_CREATE_TABLES=true|false`)
++- Logging control (`LOG_LEVEL`)
++- Rate-limit backend (`RATE_LIMIT_BACKEND=memory|redis`, optional `REDIS_URL`)
++- CORS + host hardening (`CORS_ALLOWED_ORIGINS`, `CORS_ALLOW_CREDENTIALS`, `TRUSTED_HOSTS`)
++- Security headers + HTTPS HSTS toggle (`SECURITY_HEADERS_ENABLED`, `REQUIRE_HTTPS`)
++- Auto-classification feature flag (`AUTO_CLASSIFICATION_ENABLED`)
++- LangGraph checkpoint path (`LANGGRAPH_CHECKPOINT_PATH`)
++
++Operational health endpoints:
++- Liveness: `GET /health`
++- Readiness: `GET /health/ready` (database + RAG index checks)
++
+ **2. Frontend:**
+ ```bash
+ cd FinAssist/frontend
+ npm install
++copy .env.example .env
+ npm run dev
+ ```
+ 
++Frontend `.env` uses:
++- `VITE_API_BASE_URL` (default: `http://localhost:8000/api`)
++
++### Backend Tests
++```bash
++cd FinAssist/backend
++python -m pytest -q
++```
++
++### Database Migrations (Alembic)
++```bash
++cd FinAssist/backend
++alembic upgrade head
++```
++
++Notes:
++- Use `AUTO_CREATE_TABLES=true` for local quick-start.
++- Use `AUTO_CREATE_TABLES=false` in production and rely on Alembic migrations.
++
++### CI Pipeline
++- GitHub Actions workflow: `FinAssist/.github/workflows/ci.yml`
++- Runs backend migrations + tests (`alembic upgrade head`, `python -m pytest -q`) and frontend lint/build (`npm run lint -- --max-warnings=0`, `npm run build`) on push/PR.
++
++### Production Preflight and Cutover
++Use this before production deployment to catch unsafe config values.
++
++```bash
++cd FinAssist/backend
++python scripts/production_preflight.py --strict
++```
++
++Production environment template:
++- `FinAssist/backend/.env.production.example`
++
++Recommended cutover order:
++1. Fill production env vars from `FinAssist/backend/.env.production.example`.
++2. Run preflight check in strict mode.
++3. Run migrations: `alembic upgrade head`.
++4. Start backend and verify:
++   - `GET /health`
++   - `GET /health/ready`
++5. Validate feature metrics endpoint after smoke traffic:
++   - `GET /api/realtime/metrics/feedback`
++
+ ---
+ *Developed for the ET Hackathon.* ≡ƒîƒ

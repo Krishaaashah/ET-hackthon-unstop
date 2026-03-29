@@ -13,6 +13,7 @@ class TransactionCreate(TransactionBase):
 
 class TransactionResponse(TransactionBase):
     id: int
+    user_id: Optional[int] = None
     category: Optional[str] = None
     confidence_score: Optional[float] = None
     is_tax_deductible: bool
