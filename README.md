@@ -1,19 +1,26 @@
-# 🚀 FinAssist
+#  FinAssist
 
 **FinAssist** is a full-stack, AI-powered personal financial assistant designed with multi-agent intelligence, semantic expense understanding, and a premium interactive dashboard. Built for the ET Hackathon.
 
-## ✨ Features
+##  Features
 - **Multi-Agent Core**: Dedicated LLM agents for Expense Classification, Tax deduction mapping, and Financial Trend Analysis.
 - **RAG-Powered Tax Intelligence**: Utilizes FAISS local vector databases to read tax rule logic and deduce category rules on the fly.
 - **Micro-Animated Premium UI**: A highly polished, glassmorphism dashboard built with Vite, React, Recharts, and Vanilla CSS.
 - **Conversational AI**: Interact dynamically with your transaction history through a built-in AI chat module.
 
-## 🛠️ Tech Stack
+## workflow of system
+
+https://github.com/user-attachments/assets/b299d077-05b3-479a-b563-06e602d03a12
+
+
+
+
+##  Tech Stack
 - **Backend:** Python, FastAPI, SQLAlchemy (SQLite/PostgreSQL adaptable), OpenAI APIs, FAISS 
 - **Frontend:** React, Vite, Lucide Icons, Recharts
 - **Data Ecosystem:** Pandas, Numpy, Statsmodels 
 
-## ⚙️ How to Setup & Run
+##  How to Setup & Run
 
 ### Method 1: The Easy Way (Windows)
 We've included a convenient PowerShell script that instantly launches both the Backend API and the Frontend React Server concurrently.
